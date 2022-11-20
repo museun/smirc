@@ -5,11 +5,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Context;
+use anyhow::Context as _;
 use egui::Vec2;
 use egui_extras::RetainedImage;
 use image::ImageFormat;
-use tokio_stream::StreamExt;
+use tokio_stream::StreamExt as _;
 
 use crate::Repaint;
 
@@ -172,17 +172,15 @@ impl Loader {
                 let repaint = repaint.clone();
 
                 tokio::spawn(async move {
-                    if let Some(data) = Self::fetch(client, &url).await {
-                        tokio::task::spawn_blocking(move || match Self::load(&url, data) {
-                            Ok(img) => {
-                                let _ = tx.send((url, img));
-                                repaint.repaint();
-                            }
-                            Err(err) => {
-                                eprintln!("cannot fetch: {url}: {err}")
-                            }
-                        });
-                    }
+                    let Some(data) = Self::fetch(client, &url).await else { return };
+
+                    tokio::task::spawn_blocking(move || match Self::load(&url, data) {
+                        Ok(img) => {
+                            let _ = tx.send((url, img));
+                            repaint.repaint();
+                        }
+                        Err(err) => eprintln!("cannot fetch: {url}: {err}"),
+                    });
                 });
             }
         });
@@ -194,10 +192,12 @@ impl Loader {
         let _ = self.submit.send(url.to_string());
     }
 
+    // TODO cache this
     async fn fetch(client: reqwest::Client, url: &str) -> Option<Vec<u8>> {
         eprintln!("getting: {url}");
         let resp = client.get(url).send().await.ok()?;
         if resp.status().as_u16() == 404 {
+            // TODO report this
             return None;
         }
 

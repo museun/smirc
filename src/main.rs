@@ -1082,9 +1082,7 @@ impl ActiveLayer {
             .width_range(state.icon_size..=state.icon_size)
             .resizable(false)
             .show_inside(ui, |ui| {
-                ui.vertical(|ui| {
-                    TabBar { state, cache }.display(ui);
-                });
+                ui.vertical(|ui| TabBar { state, cache }.display(ui));
             });
 
         TopBottomPanel::new(egui::panel::TopBottomSide::Bottom, "input_box")
@@ -1120,25 +1118,19 @@ impl ActiveLayer {
                     return;
                 }
 
-                let identity = match identity {
-                    Some(identity) => identity,
-                    None => {
-                        // TODO report this to the UI
-                        eprintln!("not connected");
-                        return;
-                    }
+                let Some(identity) = identity else {
+                    // TODO report this
+                    eprintln!("not connected");
+                    return;
                 };
 
                 let channel = &state.channels[state.selected];
                 writer.privmsg(&((&*channel.login).with_octo()), &buf);
 
-                let presence = match presences.get(&*((&*channel.login).with_octo())) {
-                    Some(p) => p,
-                    None => {
-                        // TODO report this to the UI
-                        eprintln!("not on: {}", channel.display_name);
-                        return;
-                    }
+                let Some(presence) = presences.get(&*((&*channel.login).with_octo())) else {
+                    // TODO report this to the UI
+                    eprintln!("not on: {}", channel.display_name);
+                    return;
                 };
 
                 let buffer = &mut state.buffers[state.selected];
@@ -1178,12 +1170,11 @@ impl ActiveLayer {
                             }
                         }
 
-                        let name = if let Some(user) = state.user_map.get(&msg.pm.user_id, fetcher)
-                        {
-                            &user.display_name
-                        } else {
-                            &msg.pm.user_id
-                        };
+                        let name = state
+                            .user_map
+                            .get(&msg.pm.user_id, fetcher)
+                            .map(|user| &user.display_name)
+                            .unwrap_or(&msg.pm.user_id);
 
                         ui.colored_label(msg.color, name);
                     });
@@ -1454,9 +1445,9 @@ impl<'a> AddChannel<'a> {
 
                     ui.scope(|ui| {
                         ui.visuals_mut().selection.stroke = Stroke::new(0.0, Color32::BLACK);
-                        let buffer = match self.add_channel_state {
-                            AddChannelState::Editing { input } => input,
-                            _ => return,
+
+                        let AddChannelState::Editing { input: buffer } = self.add_channel_state else {
+                            return;
                         };
 
                         let resp = ui.add(
@@ -1596,7 +1587,8 @@ impl PreparedMessage {
             time::macros::format_description!("[hour]:[minute]:[second]");
 
         let ts = pm.ts.to_offset(
-            time::UtcOffset::current_local_offset().expect("system should know when UTC is"),
+            time::UtcOffset::current_local_offset() //
+                .expect("system should know when UTC is"),
         );
 
         Self {
@@ -1683,11 +1675,8 @@ impl<'a> TabButton<'a> {
                     .rounding(3.0)
                     .show(ui, |ui| {
                         // TODO fix up the 'unread messages' badge
-                        let img = match self.image {
-                            Some(img) => img,
-                            None => return,
-                        };
 
+                        let Some(img) = self.image else { return };
                         let resp = img.show_size(ui, vec2(self.icon_size, self.icon_size));
 
                         if self.message_stats.unread == 0 {
@@ -1894,24 +1883,17 @@ fn load_icon() -> IconData {
 }
 
 fn load_state(cc: &CreationContext) -> State {
-    match cc
-        .storage
+    cc.storage
         .and_then(|storage| storage.get_string(Application::SAVE_KEY))
         .and_then(|data| serde_json::from_str(&data).ok())
-    {
-        Some(state) => state,
-        None => {
+        .unwrap_or_else(|| {
             eprintln!("WARNING: cannot load previous state, defaulting it");
             State::default()
-        }
-    }
+        })
 }
 
 fn get_var(key: &str) -> anyhow::Result<String> {
-    let Ok(val) = std::env::var(key) else {
-        anyhow::bail!("could not find key '{key}' in env")
-    };
-    Ok(val)
+    std::env::var(key).map_err(|_| anyhow::anyhow!("could not find key '{key}' in env"))
 }
 
 fn connect_to_twitch(
