@@ -4,7 +4,6 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
 };
-use uuid::Uuid;
 
 use crate::{BadgeMap, EmoteSpan, Repaint, TextSpan};
 
@@ -587,10 +586,4 @@ impl RawMessage {
             raw: raw.to_string(),
         })
     }
-}
-
-#[derive(Debug)]
-pub struct User {
-    pub name: String,
-    pub id: Uuid, // TODO why is there a UUID here?
 }
