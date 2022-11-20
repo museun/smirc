@@ -1958,6 +1958,7 @@ fn main() -> anyhow::Result<()> {
     })
     .blocking_recv()??;
 
+    // TODO make this less weird
     let mut badge_map = BadgeMap::default();
     badge_map.populate(global_badges.iter().flat_map(|b| {
         std::iter::repeat(&b.set_id).zip(b.versions.iter().map(|v| (&v.id, &v.image_url_1x)))

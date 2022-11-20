@@ -224,6 +224,7 @@ pub async fn run(
                 if sink.send(TwitchMessage::Disconnected).is_err() {
                     return MaybeDisconnect::Break;
                 }
+                // TODO make this exponential (maybe just log2)
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 MaybeDisconnect::Continue
             }
@@ -288,79 +289,27 @@ pub async fn run(
 
             tokio::select! {
                 msg = next => {
-
+                    // TODO move this out of the select macro so rustfmt will attempt to format it
                     let msg = check!(msg).as_deref().and_then(RawMessage::parse);
                     match msg {
-                        Some(msg) => {
-                            eprintln!("<- {}", msg.raw.escape_debug());
-                            match msg.command {
-                                Command::Ping => {
-                                    check!(write.write_all(b"PONG tmi.twitch.tv\r\n").await);
-                                    check!(write.flush().await);
-                                }
-
-                                Command::Ready => {
-                                    if let Some(ready) = msg.as_ready() {
-                                        our_user_id.replace(ready.user_id.to_string());
-
-                                        let _ = sink.send(TwitchMessage::Ready(Identity {
-                                            user_name: ready.user_name.unwrap_or(name).to_string(),
-                                            user_id: ready.user_id.to_string(),
-                                            color: ready.color,
-                                        }));
-                                    }
-                                }
-                                Command::Join => {
-                                    if let Some(join) = msg.as_join() {
-                                        if Some(join.user) == our_user_id.as_deref() {
-                                            let msg = TwitchMessage::Join(join.channel.to_string());
-                                            let _ = sink.send(msg);
-                                        }
-                                    }
-                                }
-                                Command::Part => {
-                                    if let Some(part) = msg.as_part() {
-                                        if Some(part.user) == our_user_id.as_deref() {
-                                            let msg = TwitchMessage::Part(part.channel.to_string());
-                                            let _ = sink.send(msg);
-                                        }
-                                    }
-                                }
-
-                                Command::Privmsg => {
-                                    if let Some(privmsg) = msg.as_privmsg() {
-                                        let msg = TwitchMessage::Privmsg(Privmsg {
-                                            ts: msg.ts,
-                                            tags: privmsg.tags.clone(),
-                                            room_id: privmsg.target.to_string(),
-                                            user_id: privmsg.sender.to_string(),
-                                            data: privmsg.data.to_string(),
-                                        });
-                                        let _ = sink.send(msg);
-                                    }
-                                }
-
-                                Command::Error => {
-                                    if sink.send(TwitchMessage::Disconnected).is_err() {
-                                        break 'main;
-                                    }
-                                    tokio::time::sleep(Duration::from_secs(5)).await;
-                                    continue 'main;
-                                }
-
-                                Command::UserState => {
-                                    let _ = sink.send(TwitchMessage::UserState(UserState {
-                                        channel: msg.args.first().expect("channel attached to message").clone(),
-                                        tags: msg.tags.clone(),
-                                    }));
-                                }
-
-                                _ => {}
+                        Some(msg) if matches!(msg.command, Command::Error) => {
+                            if sink.send(TwitchMessage::Disconnected).is_err() {
+                                break 'main;
                             }
-
-                            let _ = sink.send(TwitchMessage::Raw(msg));
-                            repaint.repaint();
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            continue 'main;
                         }
+
+                        Some(msg) if matches!(msg.command, Command::Ping) => {
+                            // BUG doesn't the PONG message need to send the token as a data parameter?
+                            check!(write.write_all(b"PONG tmi.twitch.tv\r\n").await);
+                            check!(write.flush().await);
+                        }
+
+                        Some(msg) => {
+                            handle_message(msg, &sink, &name, &mut our_user_id, repaint.clone());
+                        }
+
                         None => {
                             if sink.send(TwitchMessage::Disconnected).is_err() {
                                 break 'main;
@@ -380,6 +329,86 @@ pub async fn run(
             }
         }
     }
+}
+
+fn handle_message(
+    mut msg: RawMessage,
+    sink: &flume::Sender<TwitchMessage>,
+    our_name: &str,
+    our_user_id: &mut Option<String>,
+    repaint: impl Repaint,
+) -> Option<()>
+// TODO return an error instead?
+{
+    eprintln!("<- {}", msg.raw.escape_debug());
+    let _ = sink.send(TwitchMessage::Raw(msg.clone()));
+
+    match msg.command {
+        Command::Ready => {
+            let user_id = msg.tags.get("user-id")?.to_string();
+            our_user_id.replace(user_id.clone());
+
+            let _ = sink.send(TwitchMessage::Ready(Identity {
+                user_name: msg.tags.get("display-name").unwrap_or(our_name).to_string(),
+                user_id,
+                color: msg.tags.egui_color(),
+            }));
+        }
+
+        Command::Join => {
+            let channel = msg.args.get(0)?;
+            let user = msg.tags.get("user-id")?;
+
+            match our_user_id.as_deref() {
+                Some(left) if left == user => {
+                    let msg = TwitchMessage::Join(channel.to_string());
+                    let _ = sink.send(msg);
+                }
+                _ => {}
+            }
+        }
+
+        Command::Part => {
+            let channel = msg.args.get(0)?;
+            let user = msg.tags.get("user-id")?;
+
+            match our_user_id.as_deref() {
+                Some(left) if left == user => {
+                    let msg = TwitchMessage::Part(channel.to_string());
+                    let _ = sink.send(msg);
+                }
+                _ => {}
+            }
+        }
+
+        Command::Privmsg => {
+            let msg = TwitchMessage::Privmsg(Privmsg {
+                ts: msg.ts,
+                room_id: msg.tags.get("room-id")?.to_string(),
+                user_id: msg.tags.get("user-id")?.to_string(),
+                data: msg.data.take()?.to_string(),
+                tags: msg.tags,
+            });
+            let _ = sink.send(msg);
+        }
+
+        Command::UserState => {
+            let _ = sink.send(TwitchMessage::UserState(UserState {
+                channel: msg
+                    .args
+                    .first()
+                    .expect("channel attached to message")
+                    .clone(),
+                tags: msg.tags,
+            }));
+        }
+
+        _ => {}
+    }
+
+    repaint.repaint();
+
+    Some(())
 }
 
 #[derive(Debug)]
@@ -420,39 +449,7 @@ pub struct Identity {
     pub color: egui::Color32,
 }
 
-// TODO get rid of these
-pub mod messages {
-    use super::Tags;
-
-    #[derive(Debug)]
-    pub struct Ready<'a> {
-        pub user_name: Option<&'a str>,
-        pub user_id: &'a str,
-        pub color: egui::Color32,
-    }
-
-    #[derive(Debug)]
-    pub struct Join<'a> {
-        pub channel: &'a str,
-        pub user: &'a str,
-    }
-
-    #[derive(Debug)]
-    pub struct Part<'a> {
-        pub channel: &'a str,
-        pub user: &'a str,
-    }
-
-    #[derive(Debug)]
-    pub struct Privmsg<'a> {
-        pub target: &'a str,
-        pub sender: &'a str,
-        pub data: &'a str,
-        pub tags: &'a Tags,
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum Command {
     Ready,
     Ping,
@@ -485,7 +482,7 @@ impl Command {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RawMessage {
     pub ts: time::OffsetDateTime,
     pub tags: Tags,
@@ -496,61 +493,6 @@ pub struct RawMessage {
 }
 
 impl RawMessage {
-    // TODO get rid of this
-    #[deprecated(note = "why is this a thing?")]
-    fn as_ready(&self) -> Option<messages::Ready<'_>> {
-        if !matches!(self.command, Command::Ready) {
-            return None;
-        }
-
-        Some(messages::Ready {
-            user_name: self.tags.get("display-name"),
-            user_id: self.tags.get("user-id")?,
-            color: self.tags.egui_color(),
-        })
-    }
-
-    // TODO get rid of this
-    #[deprecated(note = "why is this a thing?")]
-    fn as_join(&self) -> Option<messages::Join<'_>> {
-        if !matches!(self.command, Command::Join) {
-            return None;
-        }
-
-        Some(messages::Join {
-            channel: self.args.get(0)?,
-            user: self.tags.get("user-id")?,
-        })
-    }
-
-    // TODO get rid of this
-    #[deprecated(note = "why is this a thing?")]
-    fn as_part(&self) -> Option<messages::Part<'_>> {
-        if !matches!(self.command, Command::Part) {
-            return None;
-        }
-
-        Some(messages::Part {
-            channel: self.args.get(0)?,
-            user: self.tags.get("user-id")?,
-        })
-    }
-
-    // TODO get rid of this
-    #[deprecated(note = "why is this a thing?")]
-    fn as_privmsg(&self) -> Option<messages::Privmsg<'_>> {
-        if !matches!(self.command, Command::Privmsg) {
-            return None;
-        }
-
-        Some(messages::Privmsg {
-            target: self.tags.get("room-id")?,
-            sender: self.tags.get("user-id")?,
-            data: self.data.as_deref()?,
-            tags: &self.tags,
-        })
-    }
-
     fn parse(input: &str) -> Option<Self> {
         let raw = input;
 
