@@ -1,3 +1,4 @@
 /target
 .dev.env
 .secrets.env
+history.json

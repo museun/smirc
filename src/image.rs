@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use egui::Vec2;
+use egui::{Vec2, Widget};
 use egui_extras::RetainedImage;
 use image::ImageFormat;
 use tokio_stream::StreamExt as _;
@@ -21,12 +21,19 @@ pub enum Image {
 impl Image {
     pub fn show_size(&self, ui: &mut egui::Ui, size: Vec2) -> egui::Response {
         match self {
-            Self::Static(image) => image.show_size(ui, size),
+            Self::Static(image) => ui.add(
+                egui::Image::new(image.texture_id(ui.ctx()), size)
+                    .sense(egui::Sense::hover().union(egui::Sense::click())),
+            ),
             Self::Animated(image) => {
                 let dt = ui.input().stable_dt.min(0.1);
 
                 if let Some((img, delay)) = image.frame(dt) {
-                    let resp = img.show_size(ui, size);
+                    let resp = ui.add(
+                        egui::Image::new(img.texture_id(ui.ctx()), size)
+                            .sense(egui::Sense::hover().union(egui::Sense::click())),
+                    );
+
                     ui.ctx().request_repaint_after(delay);
                     return resp;
                 }

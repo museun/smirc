@@ -5,9 +5,9 @@ use tokio::{
     net::TcpStream,
 };
 
-use crate::{ChannelExt, EmoteMap, EmoteSpan, Repaint, TextSpan, WithIter};
+use crate::{ChannelExt, EmoteMap, EmoteSpan, Repaint, TextSpan};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Tags(HashMap<String, String>);
 
 impl Tags {
@@ -329,7 +329,7 @@ pub async fn run(
                         }
 
                         Some(msg) => {
-                            handle_message(msg, &sink, &name, &mut our_user_id, repaint.clone());
+                            handle_message(msg, &sink, name, &mut our_user_id, repaint.clone());
                         }
 
                         None => {
@@ -362,7 +362,7 @@ fn handle_message(
 ) -> Option<()>
 // TODO return an error instead?
 {
-    eprintln!("<- {}", msg.raw.escape_debug());
+    // eprintln!("<- {}", msg.raw.escape_debug());
     let _ = sink.send(TwitchMessage::Raw(msg.clone()));
 
     match msg.command {
@@ -408,7 +408,7 @@ fn handle_message(
                 ts: msg.ts,
                 room_id: msg.tags.get("room-id")?.to_string(),
                 user_id: msg.tags.get("user-id")?.to_string(),
-                data: msg.data.take()?.to_string(),
+                data: msg.data.take()?,
                 tags: msg.tags,
             });
             let _ = sink.send(msg);
@@ -449,8 +449,9 @@ pub enum TwitchMessage {
     Raw(RawMessage),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Privmsg {
+    #[serde(with = "time::serde::iso8601")]
     pub ts: time::OffsetDateTime,
     pub tags: Tags,
     pub room_id: String,
@@ -550,28 +551,4 @@ impl RawMessage {
             raw: raw.to_string(),
         })
     }
-}
-
-#[tokio::test]
-async fn asdf() {
-    simple_env_load::load_env_from(&[".dev.env", ".secrets.env"]);
-
-    let client_id = std::env::var("TWITCH_CLIENT_ID").unwrap();
-    let client_secret = std::env::var("TWITCH_CLIENT_SECRET").unwrap();
-
-    let helix = crate::helix::Client::create(&client_id, &client_secret)
-        .await
-        .unwrap();
-
-    let emotes = helix.get_global_emotes().await.unwrap();
-
-    let emote_map =
-        EmoteMap::default().with_iter(emotes.into_iter().map(|emote| (emote.name, emote.id)));
-
-    let input = "hello Kappa ResidentSleeper world LUL Kappa testing LUL";
-    let s = Tags::build_emote_meta(input, &emote_map);
-    let s = format!("@emotes={s} ");
-    let tags = Tags::parse(&mut &*s).unwrap();
-    eprintln!("{tags:#?}");
-    eprintln!("{:#?}", tags.emotes(input));
 }

@@ -3,16 +3,19 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
+    io::Write,
     ops::Index,
+    path::Path,
 };
 
 use chat::Tags;
 use eframe::{epaint::Shadow, CreationContext, IconData, NativeOptions};
 use egui::{
     style::Margin, vec2, Align, Align2, Area, CentralPanel, Color32, Frame, Grid, Label, Layout,
-    Order, Pos2, RichText, Rounding, ScrollArea, Sense, SidePanel, Slider, Stroke, TextEdit,
+    Order, Pos2, Rect, RichText, Rounding, ScrollArea, Sense, SidePanel, Slider, Stroke, TextEdit,
     TextStyle, TopBottomPanel, Vec2, Window,
 };
+use egui_extras::RetainedImage;
 use egui_notify::Toasts;
 
 use serde::{Deserialize, Serialize};
@@ -327,6 +330,45 @@ impl Actions {
     }
 }
 
+#[derive(Default, Serialize, Deserialize)]
+#[serde(transparent)]
+struct History {
+    map: HashMap<String, Vec<PreparedMessage>>,
+}
+
+impl History {
+    fn add<'a>(&mut self, channel: &str, iter: impl IntoIterator<Item = &'a PreparedMessage>) {
+        let list = self.map.entry(channel.to_string()).or_default();
+        list.extend(iter.into_iter().cloned());
+        list.sort_unstable_by_key(|msg| msg.pm.ts);
+        list.dedup_by_key(|msg| msg.pm.ts)
+    }
+
+    // TODO std::io::Error
+    fn save(&self, path: impl AsRef<Path>) {
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(path)
+            .ok()
+            .map(std::io::BufWriter::new)
+            .map(|mut fi| {
+                let _ = serde_json::to_writer(&mut fi, self);
+                let _ = fi.flush();
+            });
+    }
+
+    fn load(path: impl AsRef<Path>) -> Self {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open(path)
+            .ok()
+            .map(std::io::BufReader::new)
+            .and_then(|mut fi| serde_json::from_reader(&mut fi).ok())
+            .unwrap_or_default()
+    }
+}
+
 struct Presence {
     tags: Tags,
 }
@@ -342,24 +384,35 @@ struct Application {
     user_fetcher: UserFetcher,
     active: ActiveLayer,
     toasts: Toasts,
+    history: History,
     twitch: flume::Receiver<chat::TwitchMessage>,
     identity: Option<chat::Identity>,
+    numbers: Numbers,
 }
 
 impl Application {
     const SAVE_KEY: &'static str = concat!(env!("CARGO_PKG_NAME"), "_settings");
+    const HISTORY_FILE: &'static str = concat!(env!("CARGO_MANIFEST_DIR"), "/", "history.json");
 }
 
 impl Application {
     fn new(
-        state: State,
+        mut state: State,
         helix: helix::Client,
         writer: chat::IrcWriter,
         emotes: EmoteMap,
         badges: BadgeMap,
+        history: History,
         twitch: flume::Receiver<chat::TwitchMessage>,
+        numbers: Numbers,
         repaint: impl Repaint + 'static,
     ) -> Self {
+        for (i, id) in state.channels.iter().map(|ch| &ch.id).enumerate() {
+            let Some(history) = history.map.get(id) else {continue};
+            let buffer = &mut state.buffers[i];
+            buffer.load_history(history);
+        }
+
         Self {
             state,
             emotes,
@@ -371,8 +424,10 @@ impl Application {
             presences: HashMap::new(),
             active: ActiveLayer::default(),
             toasts: Toasts::new(),
+            history,
             twitch,
             identity: None,
+            numbers,
         }
     }
 
@@ -399,29 +454,28 @@ impl Application {
             self.handle_select_previous();
         }
 
-        if let Some(keybind) = Self::find_first_keybind(ctx) {
-            if let Some(action) = self.state.actions.find_action(keybind) {
-                use Action::*;
-                match action {
-                    ShowCommandPalette => self.show_command_palette(),
-                    ToggleJoinWindow => self.toggle_join_window(),
-                    ShowKeyBindings => self.show_key_bindings(),
-                    ShowSettings => self.show_settings(),
-                    SwitchChannel0 => self.switch_channel(0),
-                    SwitchChannel1 => self.switch_channel(1),
-                    SwitchChannel2 => self.switch_channel(2),
-                    SwitchChannel3 => self.switch_channel(3),
-                    SwitchChannel4 => self.switch_channel(4),
-                    SwitchChannel5 => self.switch_channel(5),
-                    SwitchChannel6 => self.switch_channel(6),
-                    SwitchChannel7 => self.switch_channel(7),
-                    SwitchChannel8 => self.switch_channel(8),
-                    SwitchChannel9 => self.switch_channel(9),
-                    NextChannel => self.next_channel(),
-                    PreviousChannel => self.previous_channel(),
-                };
-            }
-        }
+        let Some(keybind) = Self::find_first_keybind(ctx) else { return };
+        let Some(action) = self.state.actions.find_action(keybind) else { return };
+
+        use Action::*;
+        match action {
+            ShowCommandPalette => self.show_command_palette(),
+            ToggleJoinWindow => self.toggle_join_window(),
+            ShowKeyBindings => self.show_key_bindings(),
+            ShowSettings => self.show_settings(),
+            SwitchChannel0 => self.switch_channel(0),
+            SwitchChannel1 => self.switch_channel(1),
+            SwitchChannel2 => self.switch_channel(2),
+            SwitchChannel3 => self.switch_channel(3),
+            SwitchChannel4 => self.switch_channel(4),
+            SwitchChannel5 => self.switch_channel(5),
+            SwitchChannel6 => self.switch_channel(6),
+            SwitchChannel7 => self.switch_channel(7),
+            SwitchChannel8 => self.switch_channel(8),
+            SwitchChannel9 => self.switch_channel(9),
+            NextChannel => self.next_channel(),
+            PreviousChannel => self.previous_channel(),
+        };
     }
 
     fn find_first_keybind(ctx: &egui::Context) -> Option<KeyBind> {
@@ -550,19 +604,14 @@ impl Application {
                         .user_map
                         .get(&privmsg.user_id, &self.user_fetcher);
 
-                    match self
+                    if let Some(index) = self
                         .state
                         .channels
                         .iter()
                         .position(|ch| ch.id == privmsg.room_id)
                     {
-                        Some(index) => {
-                            let buffer = &mut self.state.buffers[index];
-                            buffer.append(PreparedMessage::new(privmsg, &mut self.badges));
-                        }
-                        None => {
-                            eprintln!("not on channel: {}", privmsg.room_id)
-                        }
+                        let buffer = &mut self.state.buffers[index];
+                        buffer.append(PreparedMessage::new(privmsg, &mut self.badges));
                     }
                 }
 
@@ -590,6 +639,7 @@ impl eframe::App for Application {
             &self.user_fetcher,
             &mut self.toasts,
             &self.helix,
+            &self.numbers,
             ctx,
             frame,
         );
@@ -600,6 +650,12 @@ impl eframe::App for Application {
             Self::SAVE_KEY,
             serde_json::to_string(&self.state).expect("valid json"),
         );
+
+        for (buffer, channel) in self.state.buffers.iter().zip(self.state.channels.iter()) {
+            self.history.add(&channel.id, buffer.ring.iter())
+        }
+
+        self.history.save(Self::HISTORY_FILE);
     }
 }
 
@@ -821,6 +877,7 @@ impl ActiveLayer {
         fetcher: &UserFetcher,
         toasts: &mut Toasts,
         helix: &helix::Client,
+        numbers: &Numbers,
         ctx: &egui::Context,
         frame: &eframe::Frame,
     ) {
@@ -830,7 +887,8 @@ impl ActiveLayer {
             .frame(Frame::none().fill(ctx.style().visuals.faint_bg_color))
             .show(ctx, |ui| {
                 Self::display_main_view(
-                    active, state, cache, emotes, badges, presences, identity, writer, fetcher, ui,
+                    active, state, cache, emotes, badges, presences, identity, writer, fetcher,
+                    numbers, ui,
                 );
                 match self {
                     Self::CommandPalette { selected } => {
@@ -840,6 +898,10 @@ impl ActiveLayer {
                             }
                             PaletteAction::RemoveChannel(i) => {
                                 state.channels.remove(i);
+                                state.buffers.remove(i);
+                                if state.selected == i {
+                                    state.selected = i.saturating_sub(1);
+                                }
                             }
                             PaletteAction::Nothing => {}
                         }
@@ -1075,6 +1137,7 @@ impl ActiveLayer {
         identity: &Option<chat::Identity>,
         writer: &chat::IrcWriter,
         fetcher: &UserFetcher,
+        numbers: &Numbers,
         ui: &mut egui::Ui,
     ) {
         // TODO allow this to also be on the bottom
@@ -1088,7 +1151,16 @@ impl ActiveLayer {
             .width_range(state.icon_size..=state.icon_size)
             .resizable(false)
             .show_inside(ui, |ui| {
-                ui.vertical(|ui| TabBar { state, cache }.display(ui));
+                ScrollArea::vertical().show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        TabBar {
+                            state,
+                            cache,
+                            numbers,
+                        }
+                        .display(ui)
+                    });
+                });
             });
 
         TopBottomPanel::new(egui::panel::TopBottomSide::Bottom, "input_box")
@@ -1216,6 +1288,8 @@ impl ActiveLayer {
                     });
                 });
             }
+
+            ui.allocate_space(ui.available_size());
         });
     }
 }
@@ -1527,6 +1601,7 @@ impl<'a> AddChannel<'a> {
 struct TabBar<'a> {
     state: &'a mut State,
     cache: &'a mut img::Cache,
+    numbers: &'a Numbers,
 }
 
 impl<'a> TabBar<'a> {
@@ -1534,14 +1609,16 @@ impl<'a> TabBar<'a> {
         for (index, channel) in self.state.channels.iter().enumerate() {
             let stats = &mut self.state.buffers[index].message_stats;
             stats.check_active(index == self.state.selected);
+            let Some(image) = self.cache.get(&channel.profile_image_url) else { continue };
 
             TabButton {
-                image: self.cache.get(&channel.profile_image_url),
+                image,
                 name: &channel.display_name,
                 selected: &mut self.state.selected,
                 index,
                 icon_size: self.state.icon_size,
                 message_stats: stats,
+                numbers: self.numbers,
             }
             .display(ui);
         }
@@ -1583,7 +1660,7 @@ impl<T> Ring<T> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PreparedMessage {
     pm: chat::Privmsg,
     ts: String,
@@ -1642,6 +1719,12 @@ impl Buffer {
         self.ring.buf.clear();
     }
 
+    fn load_history<'a>(&mut self, iter: impl IntoIterator<Item = &'a PreparedMessage>) {
+        for msg in iter.into_iter().cloned() {
+            self.ring.push(msg)
+        }
+    }
+
     fn append(&mut self, message: PreparedMessage) {
         self.message_stats.unread = self
             .message_stats
@@ -1668,70 +1751,78 @@ impl MessageStats {
 }
 
 struct TabButton<'a> {
-    image: Option<&'a img::Image>,
-    name: &'a str, // TODO this should be the helix::User
+    image: &'a img::Image,
+    name: &'a str,
     index: usize,
     selected: &'a mut usize,
     icon_size: f32,
     message_stats: &'a MessageStats,
+    numbers: &'a Numbers,
 }
 
 impl<'a> TabButton<'a> {
     fn display(self, ui: &mut egui::Ui) {
-        let id = egui::Id::new(self.name).with("tab_button");
+        let resp = self
+            .image
+            .show_size(ui, vec2(self.icon_size, self.icon_size));
 
-        // TODO why are we pushing an id for this?
-        let resp = ui.add(|ui: &mut egui::Ui| {
-            ui.push_id(id, |ui| {
-                // TODO instead of this horrible frame, just draw an indent + arrow pointing to the channel we're looking at
-                Frame::none()
-                    .stroke(
-                        (*self.selected == self.index)
-                            .then_some(Stroke::new(3.0, Color32::RED))
-                            .unwrap_or_else(Stroke::none),
-                    )
-                    .rounding(3.0)
-                    .show(ui, |ui| {
-                        // TODO fix up the 'unread messages' badge
+        if *self.selected != self.index {
+            ui.painter_at(resp.rect).rect_filled(
+                resp.rect,
+                Rounding::none(),
+                egui::Color32::from_rgba_premultiplied(48, 48, 48, 0xDD),
+            )
+        }
 
-                        let Some(img) = self.image else { return };
-                        let resp = img.show_size(ui, vec2(self.icon_size, self.icon_size));
+        if self.message_stats.unread != 0 {
+            let scale = self.icon_size / 2.0;
 
-                        if self.message_stats.unread == 0 {
-                            return;
+            let n = self.message_stats.unread;
+            ui.put(
+                {
+                    let rect = resp.rect;
+                    match n {
+                        1..=9 => {
+                            let tl = rect.left_top();
+                            let w = rect.width();
+                            let x = tl.x + w / 2.0 - scale / 2.0;
+                            Rect::from_min_max(Pos2::new(x, tl.y), rect.max)
                         }
+                        _ => rect,
+                    }
+                },
+                |ui: &mut egui::Ui| -> egui::Response {
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let size = vec2(scale, scale);
 
-                        let n = self.message_stats.unread;
-                        let painter = ui.painter_at(resp.rect);
+                        ui.horizontal(|ui| {
+                            if n > 99 {
+                                let nine = &self.numbers.images[9];
+                                nine.show_size(ui, size);
+                                nine.show_size(ui, size);
+                                let plus = &self.numbers.plus;
+                                plus.show_size(ui, size);
+                                return;
+                            }
 
-                        let galley = painter.layout_no_wrap(
-                            format!("{n: >3}"),
-                            egui::TextStyle::Small.resolve(ui.style()),
-                            Color32::WHITE,
-                        );
+                            for digit in self.numbers.digits(n) {
+                                digit.show_size(ui, size);
+                            }
+                        });
+                    });
 
-                        let Pos2 { x: x1, y: y1 } = resp.rect.right_top();
-                        let Vec2 { x: x2, .. } = galley.size();
-
-                        let padding = 2.0;
-
-                        painter.rect(
-                            egui::Rect::from_min_size(Pos2::new(x1 - x2 - padding, y1), {
-                                let mut v = galley.size();
-                                v.x += padding;
-                                v
-                            }),
-                            Rounding::same(padding),
-                            Color32::RED,
-                            Stroke::new(2.0, Color32::BLACK),
-                        );
-
-                        painter.galley(Pos2::new(x1 - (x2 + padding), y1), galley);
-                    })
-            })
-            .response
-            .interact(Sense::click().union(Sense::hover()))
-        });
+                    ui.allocate_response(
+                        Vec2::ZERO,
+                        Sense {
+                            click: false,
+                            drag: false,
+                            focusable: false,
+                        },
+                    )
+                },
+            );
+        }
 
         if resp.clicked() {
             *self.selected = self.index;
@@ -1893,22 +1984,20 @@ where
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TextSpan {
     Text(String),
     Emote(EmoteSpan),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EmoteSpan {
     urls: [String; 2],
 }
 
 impl EmoteSpan {
     // TODO be much smarter about this non-sense
-    fn new(id: impl ToString) -> Self {
-        let id = id.to_string();
-
+    fn new(id: &str) -> Self {
         Self {
             urls: [
                 format!(
@@ -1992,6 +2081,61 @@ fn validate_state(state: &mut State) {
     }
 }
 
+struct Numbers {
+    images: [RetainedImage; 10],
+    plus: RetainedImage,
+}
+
+impl Numbers {
+    fn load() -> Self {
+        macro_rules! load {
+            ($id:expr) => {
+                egui_extras::RetainedImage::from_image_bytes(
+                    $id,
+                    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/numbers/", $id)),
+                )
+                .unwrap()
+            };
+        }
+
+        Self {
+            images: [
+                load!("zero.png"),
+                load!("one.png"),
+                load!("two.png"),
+                load!("three.png"),
+                load!("four.png"),
+                load!("five.png"),
+                load!("six.png"),
+                load!("seven.png"),
+                load!("eight.png"),
+                load!("nine.png"),
+            ],
+            plus: egui_extras::RetainedImage::from_image_bytes(
+                "plus.png",
+                include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/", "smorc.png")),
+            )
+            .unwrap(),
+        }
+    }
+
+    fn digits(&self, mut input: usize) -> impl Iterator<Item = &RetainedImage> {
+        let mut div = 1;
+        while input >= div * 10 {
+            div *= 10;
+        }
+        std::iter::from_fn(move || {
+            if div == 0 {
+                return None;
+            }
+            let v = input / div;
+            input %= div;
+            div /= 10;
+            Some(&self.images[v])
+        })
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     simple_env_load::load_env_from([".dev.env", ".secrets.env"]);
 
@@ -2040,6 +2184,8 @@ fn main() -> anyhow::Result<()> {
             .map(|emote| (emote.name, emote.id)),
     );
 
+    let history = History::load(Application::HISTORY_FILE);
+
     eframe::run_native(
         "SMirc",
         NativeOptions {
@@ -2067,7 +2213,9 @@ fn main() -> anyhow::Result<()> {
                 writer,
                 emote_map,
                 badge_map,
+                history,
                 rx,
+                Numbers::load(),
                 cc.egui_ctx.clone(),
             ))
         }),
