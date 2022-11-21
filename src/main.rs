@@ -333,6 +333,7 @@ struct Presence {
 
 struct Application {
     state: State,
+    emotes: EmoteMap,
     badges: BadgeMap,
     presences: HashMap<String, Presence>,
     cache: img::Cache,
@@ -354,12 +355,14 @@ impl Application {
         state: State,
         helix: helix::Client,
         writer: chat::IrcWriter,
+        emotes: EmoteMap,
         badges: BadgeMap,
         twitch: flume::Receiver<chat::TwitchMessage>,
         repaint: impl Repaint + 'static,
     ) -> Self {
         Self {
             state,
+            emotes,
             badges,
             cache: img::Cache::new(img::Loader::spawn(repaint.clone())),
             user_fetcher: UserFetcher::spawn(helix.clone(), repaint),
@@ -434,7 +437,7 @@ impl Application {
             _ => None,
         })?;
 
-        // XXX: Egui treats ctrl weirdly, so we'll pretend it doesn't exist and use `command` instead
+        // NOTE: egui treats ctrl weirdly, so we'll pretend it doesn't exist and use `command` instead
         keybind.modifiers.ctrl = false;
         Some(keybind)
     }
@@ -581,6 +584,7 @@ impl eframe::App for Application {
             &mut self.cache,
             &self.identity,
             &self.presences,
+            &mut self.emotes,
             &mut self.badges,
             &self.writer,
             &self.user_fetcher,
@@ -811,6 +815,7 @@ impl ActiveLayer {
         cache: &mut image::Cache,
         identity: &Option<chat::Identity>,
         presences: &HashMap<String, Presence>,
+        emotes: &mut EmoteMap,
         badges: &mut BadgeMap,
         writer: &chat::IrcWriter,
         fetcher: &UserFetcher,
@@ -825,7 +830,7 @@ impl ActiveLayer {
             .frame(Frame::none().fill(ctx.style().visuals.faint_bg_color))
             .show(ctx, |ui| {
                 Self::display_main_view(
-                    active, state, cache, badges, presences, identity, writer, fetcher, ui,
+                    active, state, cache, emotes, badges, presences, identity, writer, fetcher, ui,
                 );
                 match self {
                     Self::CommandPalette { selected } => {
@@ -1064,6 +1069,7 @@ impl ActiveLayer {
         active: bool,
         state: &mut State,
         cache: &mut image::Cache,
+        emote_map: &mut EmoteMap,
         badge_map: &mut BadgeMap,
         presences: &HashMap<String, Presence>,
         identity: &Option<chat::Identity>,
@@ -1133,10 +1139,15 @@ impl ActiveLayer {
                     return;
                 };
 
+                let emotes = Tags::build_emote_meta(&buf, emote_map);
+
+                let mut tags = presence.tags.clone();
+                tags.insert("emotes", emotes);
+
                 let buffer = &mut state.buffers[state.selected];
                 let pm = chat::Privmsg {
                     ts: time::OffsetDateTime::now_utc(),
-                    tags: presence.tags.clone(),
+                    tags,
                     room_id: channel.id.clone(),
                     user_id: identity.user_id.clone(),
                     data: buf,
@@ -1593,7 +1604,14 @@ impl PreparedMessage {
 
         Self {
             color: pm.tags.egui_color(),
-            badges: pm.tags.badges(map),
+            badges: pm
+                .tags
+                .badges()
+                // BUG this flat_map should actually be a map
+                // it should look up unknown badges (how?)
+                .flat_map(|(k, v)| map.get(k, v))
+                .map(ToString::to_string)
+                .collect(),
             message_spans: pm.tags.emotes(&pm.data),
             ts: ts.format(&FORMAT).expect("valid timestamp"),
             pm,
@@ -1801,6 +1819,50 @@ impl UserMap {
     }
 }
 
+pub trait WithIter<T>
+where
+    Self: Sized,
+{
+    fn with_iter(self, ex: impl IntoIterator<Item = T>) -> Self;
+}
+
+impl<C, T> WithIter<T> for C
+where
+    C: Extend<T>,
+{
+    fn with_iter(mut self, ex: impl IntoIterator<Item = T>) -> Self {
+        self.extend(ex);
+        self
+    }
+}
+
+#[derive(Default)]
+pub struct EmoteMap {
+    map: HashMap<String, String>,
+}
+
+impl EmoteMap {
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.map.get(key).map(|c| &**c)
+    }
+}
+
+impl<K, V> Extend<(K, V)> for EmoteMap
+where
+    K: ToString,
+    V: ToString,
+{
+    fn extend<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = (K, V)>,
+    {
+        self.map.extend(
+            iter.into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+        )
+    }
+}
+
 #[derive(Default)]
 pub struct BadgeMap {
     map: HashMap<String, HashMap<String, String>>,
@@ -1810,15 +1872,19 @@ impl BadgeMap {
     pub fn get(&self, id: &str, version: &str) -> Option<&str> {
         self.map.get(id)?.get(version).map(|v| &**v)
     }
+}
 
-    // TODO we need to populate channel badges too
-    pub fn populate<K, T, V>(&mut self, badges: impl IntoIterator<Item = (K, (T, V))>)
+impl<K, T, V> Extend<(K, (T, V))> for BadgeMap
+where
+    K: ToString,
+    T: ToString,
+    V: ToString,
+{
+    fn extend<I>(&mut self, iter: I)
     where
-        K: ToString,
-        T: ToString,
-        V: ToString,
+        I: IntoIterator<Item = (K, (T, V))>,
     {
-        for (id, (k, v)) in badges {
+        for (id, (k, v)) in iter {
             self.map
                 .entry(id.to_string())
                 .or_default()
@@ -1942,6 +2008,7 @@ fn main() -> anyhow::Result<()> {
         oauth_token: twitch_oauth_token,
     };
 
+    // TODO get rid of this, a UI should be provided for it
     let reset = get_var("RESET_SETTINGS").is_ok();
 
     let now = std::time::Instant::now();
@@ -1952,17 +2019,26 @@ fn main() -> anyhow::Result<()> {
     let helix = helix.blocking_recv()??;
     eprintln!("helix took: {:.3?}", now.elapsed());
 
-    let global_badges = runtime::spawn({
+    let (global_badges, global_emotes) = runtime::spawn({
         let helix = helix.clone();
-        async move { helix.get_global_badges().await }
+        async move {
+            let badges = helix.get_global_badges();
+            let emotes = helix.get_global_emotes();
+            let (badges, emotes) = tokio::join!(badges, emotes);
+            Result::<_, anyhow::Error>::Ok((badges?, emotes?))
+        }
     })
     .blocking_recv()??;
 
-    // TODO make this less weird
-    let mut badge_map = BadgeMap::default();
-    badge_map.populate(global_badges.iter().flat_map(|b| {
+    let badge_map = BadgeMap::default().with_iter(global_badges.iter().flat_map(|b| {
         std::iter::repeat(&b.set_id).zip(b.versions.iter().map(|v| (&v.id, &v.image_url_1x)))
     }));
+
+    let emote_map = EmoteMap::default().with_iter(
+        global_emotes
+            .into_iter()
+            .map(|emote| (emote.name, emote.id)),
+    );
 
     eframe::run_native(
         "SMirc",
@@ -1971,11 +2047,10 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         },
         Box::new(move |cc| {
-            let mut state = if !reset {
-                load_state(cc)
-            } else {
+            let mut state = if reset {
                 State::default()
-                // .with_demo_channels()
+            } else {
+                load_state(cc)
             };
 
             validate_state(&mut state);
@@ -1990,6 +2065,7 @@ fn main() -> anyhow::Result<()> {
                 state,
                 helix,
                 writer,
+                emote_map,
                 badge_map,
                 rx,
                 cc.egui_ctx.clone(),

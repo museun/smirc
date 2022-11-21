@@ -5,7 +5,7 @@ use tokio::{
     net::TcpStream,
 };
 
-use crate::{BadgeMap, EmoteSpan, Repaint, TextSpan};
+use crate::{ChannelExt, EmoteMap, EmoteSpan, Repaint, TextSpan, WithIter};
 
 #[derive(Debug, Clone, Default)]
 pub struct Tags(HashMap<String, String>);
@@ -40,18 +40,54 @@ impl Tags {
         self.get(key).map(<str>::parse)
     }
 
+    pub fn build_emote_meta(input: &str, emote_map: &EmoteMap) -> String {
+        let mut emotes = HashMap::<&str, Vec<(usize, usize)>>::new();
+
+        let mut start = 0;
+        let len = input.chars().count();
+        for (i, ch) in input.char_indices() {
+            if i == len - 1 {
+                if let Some(id) = emote_map.get(&input[start..]) {
+                    emotes.entry(id).or_default().push((start, i));
+                }
+                break;
+            }
+
+            if !ch.is_ascii_whitespace() {
+                continue;
+            }
+
+            if let Some(id) = emote_map.get(&input[start..i]) {
+                emotes.entry(id).or_default().push((start, i));
+            }
+            start = i + 1;
+        }
+
+        emotes.into_iter().fold(String::new(), |mut a, (id, list)| {
+            if !a.is_empty() {
+                a.push('/')
+            }
+            a.push_str(id);
+            a.push(':');
+            for (i, (start, end)) in list.into_iter().enumerate() {
+                if i != 0 {
+                    a.push(',');
+                }
+                a.push_str(&format!("{start}-{end}"))
+            }
+            a
+        })
+    }
+
     pub fn insert(&mut self, key: impl ToString, val: impl ToString) {
         self.0.insert(key.to_string(), val.to_string());
     }
 
-    pub fn badges(&self, map: &BadgeMap) -> Vec<String> {
+    pub fn badges(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
         self.get("badges")
             .into_iter()
             .flat_map(|badges| badges.split(','))
             .flat_map(|badge| badge.split_once('/'))
-            .flat_map(|(badge, version)| map.get(badge, version))
-            .map(ToString::to_string)
-            .collect()
     }
 
     pub fn emotes(&self, data: &str) -> Vec<TextSpan> {
@@ -141,6 +177,7 @@ impl Tags {
             .ok()
             .flatten()
             .unwrap_or_default();
+
         egui::Color32::from_rgb(r, g, b)
     }
 }
@@ -156,26 +193,12 @@ impl IrcWriter {
     }
 
     pub fn join(&self, channel: &str) {
-        use std::borrow::Cow;
-
-        let channel = if channel.starts_with('#') {
-            Cow::Borrowed(channel)
-        } else {
-            Cow::Owned(format!("#{channel}"))
-        };
-
+        let channel = channel.with_octo();
         let _ = self.sender.send(format!("JOIN {channel}\r\n"));
     }
 
     pub fn part(&self, channel: &str) {
-        use std::borrow::Cow;
-
-        let channel = if channel.starts_with('#') {
-            Cow::Borrowed(channel)
-        } else {
-            Cow::Owned(format!("#{channel}"))
-        };
-
+        let channel = channel.with_octo();
         let _ = self.sender.send(format!("PART {channel}\r\n"));
     }
 
@@ -301,8 +324,7 @@ pub async fn run(
                         }
 
                         Some(msg) if matches!(msg.command, Command::Ping) => {
-                            // BUG doesn't the PONG message need to send the token as a data parameter?
-                            check!(write.write_all(b"PONG tmi.twitch.tv\r\n").await);
+                            check!(write.write_all(b"PONG :tmi.twitch.tv\r\n").await);
                             check!(write.flush().await);
                         }
 
@@ -528,4 +550,28 @@ impl RawMessage {
             raw: raw.to_string(),
         })
     }
+}
+
+#[tokio::test]
+async fn asdf() {
+    simple_env_load::load_env_from(&[".dev.env", ".secrets.env"]);
+
+    let client_id = std::env::var("TWITCH_CLIENT_ID").unwrap();
+    let client_secret = std::env::var("TWITCH_CLIENT_SECRET").unwrap();
+
+    let helix = crate::helix::Client::create(&client_id, &client_secret)
+        .await
+        .unwrap();
+
+    let emotes = helix.get_global_emotes().await.unwrap();
+
+    let emote_map =
+        EmoteMap::default().with_iter(emotes.into_iter().map(|emote| (emote.name, emote.id)));
+
+    let input = "hello Kappa ResidentSleeper world LUL Kappa testing LUL";
+    let s = Tags::build_emote_meta(input, &emote_map);
+    let s = format!("@emotes={s} ");
+    let tags = Tags::parse(&mut &*s).unwrap();
+    eprintln!("{tags:#?}");
+    eprintln!("{:#?}", tags.emotes(input));
 }
