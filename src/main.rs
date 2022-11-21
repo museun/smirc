@@ -1,12 +1,5 @@
 // #![cfg_attr(debug_assertions, allow(dead_code, unused_variables,))]
-// TODO refactor this into more modules
-use std::{
-    borrow::Cow,
-    collections::{HashMap, HashSet, VecDeque},
-    io::Write,
-    ops::Index,
-    path::Path,
-};
+use std::collections::HashMap;
 
 use chat::Tags;
 use eframe::{epaint::Shadow, CreationContext, IconData, NativeOptions};
@@ -15,47 +8,16 @@ use egui::{
     Order, Pos2, Rect, RichText, Rounding, ScrollArea, Sense, SidePanel, Slider, Stroke, TextEdit,
     TextStyle, TopBottomPanel, Vec2, Window,
 };
-use egui_extras::RetainedImage;
+
 use egui_notify::Toasts;
 
-use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot::Receiver;
-use tokio_stream::StreamExt;
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct Channel {
-    id: String,
-    profile_image_url: String,
-    login: String,
-    display_name: String,
-}
+mod channel;
+use channel::Channel;
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct State {
-    icon_size: f32,
-    pixels_per_point: f32,
-    channels: Vec<Channel>,
-    #[serde(skip)]
-    buffers: Vec<Buffer>,
-    selected: usize,
-    actions: Actions,
-    user_map: UserMap,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        let (channels, buffers, selected, actions, user_map) = <_>::default();
-        Self {
-            icon_size: 32.0,
-            pixels_per_point: 2.0,
-            channels,
-            buffers,
-            selected,
-            actions,
-            user_map,
-        }
-    }
-}
+mod state;
+use state::State;
 
 mod runtime;
 
@@ -63,315 +25,59 @@ mod image;
 use crate::image as img;
 
 mod repaint;
-pub use repaint::Repaint;
+use repaint::Repaint;
 
 mod helix;
 
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum Action {
-    ToggleJoinWindow,
-    ShowCommandPalette,
-    ShowKeyBindings,
-    ShowSettings,
-    SwitchChannel0,
-    SwitchChannel1,
-    SwitchChannel2,
-    SwitchChannel3,
-    SwitchChannel4,
-    SwitchChannel5,
-    SwitchChannel6,
-    SwitchChannel7,
-    SwitchChannel8,
-    SwitchChannel9,
-    NextChannel,
-    PreviousChannel,
-}
+mod action;
+use action::Action;
 
-impl Action {
-    const fn stringify(&self) -> &'static str {
-        match self {
-            Self::ToggleJoinWindow => "Toggle join window",
-            Self::ShowCommandPalette => "Show command palette",
-            Self::ShowSettings => "Show settings",
-            Self::ShowKeyBindings => "Show key bindings",
-            Self::SwitchChannel0 => "Switch channel 0",
-            Self::SwitchChannel1 => "Switch channel 1",
-            Self::SwitchChannel2 => "Switch channel 2",
-            Self::SwitchChannel3 => "Switch channel 3",
-            Self::SwitchChannel4 => "Switch channel 4",
-            Self::SwitchChannel5 => "Switch channel 5",
-            Self::SwitchChannel6 => "Switch channel 6",
-            Self::SwitchChannel7 => "Switch channel 7",
-            Self::SwitchChannel8 => "Switch channel 8",
-            Self::SwitchChannel9 => "Switch channel 9",
-            Self::NextChannel => "Next channel",
-            Self::PreviousChannel => "Previous channel",
-        }
-    }
-}
+mod keybind;
+use keybind::KeyBind;
 
-#[derive(Copy, Clone, Serialize, Deserialize)]
-pub struct KeyBind {
-    modifiers: egui::Modifiers,
-    key: egui::Key,
-}
+mod actions;
+use actions::Actions;
 
-impl PartialEq for KeyBind {
-    fn eq(&self, other: &Self) -> bool {
-        self.modifiers == other.modifiers && self.key == other.key
-    }
-}
+mod history;
+use history::History;
 
-impl std::fmt::Debug for KeyBind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.stringify())
-    }
-}
+mod presence;
+use presence::Presence;
 
-impl KeyBind {
-    fn stringify(&self) -> String {
-        format!(
-            "{}{}",
-            stringify_modifier(self.modifiers),
-            stringify_key(self.key)
-        )
-    }
-}
+mod util;
+use util::{ChannelExt, WithIter};
 
-fn stringify_modifier(modifiers: egui::Modifiers) -> String {
-    let mut buf = String::new();
-    for repr in [
-        (modifiers.command, "Ctrl"),
-        (modifiers.alt, "Alt"),
-        (modifiers.shift, "Shift"),
-    ]
-    .into_iter()
-    .filter_map(|(c, key)| c.then_some(key))
-    {
-        if !buf.is_empty() {
-            buf.push('+')
-        }
-        buf.push_str(repr)
-    }
+mod numbers;
+use numbers::Numbers;
 
-    if modifiers != egui::Modifiers::NONE && !buf.is_empty() {
-        buf.push('+')
-    }
-    buf
-}
+mod ring;
+use ring::Ring;
 
-fn stringify_key(key: egui::Key) -> &'static str {
-    macro_rules! s {
-        ($($key:ident)*) => {
-            &[ $( (stringify!($key), $key), )* ]
-        };
-    }
+mod prepared_message;
+use prepared_message::PreparedMessage;
 
-    use egui::Key::*;
-    const KEYS: &[(&str, egui::Key)] = s! {
-        ArrowDown ArrowLeft ArrowRight ArrowUp
-        Escape    Tab       Backspace  Enter
-        Space     Insert    Delete     Home
-        End       PageUp    PageDown
+mod buffer;
+use buffer::Buffer;
 
-        Num0 Num1 Num2 Num3 Num4 Num5 Num6 Num7 Num8 Num9
+mod message_stats;
+use message_stats::MessageStats;
 
-        Backslash Colon  Comma    Equals    Grave LBracket
-        Minus     Period RBracket Semicolon Slash
+mod chat;
 
-        A B C D E F G H I J K L M
-        N O P Q R S T U V W X Y Z
+mod user_fetcher;
+use user_fetcher::UserFetcher;
 
-        F1  F2  F3  F4  F5  F6  F7  F8  F9  F10
-        F11 F12 F13 F14 F15 F16 F17 F18 F19 F20
-    };
+mod user_map;
+use user_map::UserMap;
 
-    KEYS.iter()
-        .find_map(|(name, k)| (*k == key).then_some(*name))
-        .unwrap()
-}
+mod emote_map;
+use emote_map::EmoteMap;
 
-impl std::hash::Hash for KeyBind {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        #[derive(Hash)]
-        struct Modifiers {
-            alt: bool,
-            ctrl: bool,
-            shift: bool,
-            command: bool,
-        }
+mod badge_map;
+use badge_map::BadgeMap;
 
-        let egui::Modifiers {
-            alt,
-            ctrl,
-            shift,
-            command,
-            ..
-        } = self.modifiers;
-        Modifiers {
-            alt,
-            ctrl,
-            shift,
-            command,
-        }
-        .hash(state);
-        self.key.hash(state);
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Actions {
-    map: Vec<(KeyBind, Action)>,
-}
-
-impl Default for Actions {
-    fn default() -> Self {
-        Self::default_keybinds()
-    }
-}
-
-impl Index<usize> for Actions {
-    type Output = Action;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        let (_, action) = &self.map[index];
-        action
-    }
-}
-
-impl Actions {
-    fn default_keybinds() -> Self {
-        use Action::*;
-
-        macro_rules! key {
-            (@inner $modifier:ident => $key:ident) => {
-                KeyBind { modifiers: egui::Modifiers::$modifier, key: egui::Key::$key }
-            };
-            (@ident:ident) => {
-                key!(@inner NONE => $ident)
-            };
-            (alt $ident:ident) => {
-                key!(@inner ALT => $ident)
-            };
-            (ctrl $ident:ident) => {
-                key!(@inner COMMAND => $ident)
-            };
-        }
-
-        Self {
-            map: vec![
-                (key!(ctrl P), ShowCommandPalette),
-                (key!(ctrl J), ToggleJoinWindow),
-                (key!(ctrl H), ShowKeyBindings),
-                (key!(ctrl S), ShowSettings),
-                (key!(ctrl Num1), SwitchChannel0),
-                (key!(ctrl Num2), SwitchChannel1),
-                (key!(ctrl Num3), SwitchChannel2),
-                (key!(ctrl Num4), SwitchChannel3),
-                (key!(ctrl Num5), SwitchChannel4),
-                (key!(ctrl Num6), SwitchChannel5),
-                (key!(ctrl Num7), SwitchChannel6),
-                (key!(ctrl Num8), SwitchChannel7),
-                (key!(ctrl Num9), SwitchChannel8),
-                (key!(ctrl Num0), SwitchChannel9),
-                (key!(ctrl LBracket), PreviousChannel),
-                (key!(ctrl RBracket), NextChannel),
-            ],
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    fn first_visible_action_index(&self) -> usize {
-        let (index, ..) = self
-            .list_actions()
-            .next()
-            .expect("atleast one visible action");
-        index
-    }
-
-    fn last_visible_action_index(&self) -> usize {
-        let (index, ..) = self
-            .list_actions()
-            .rev()
-            .next()
-            .expect("atleast one visible action");
-        index
-    }
-
-    fn list_actions(
-        &self,
-    ) -> impl Iterator<Item = (usize, KeyBind, Action)> + DoubleEndedIterator + '_ {
-        const VISIBLE_ACTIONS: &[Action] = &[
-            Action::ToggleJoinWindow, //
-            Action::ShowKeyBindings,
-            Action::ShowSettings,
-        ];
-
-        self.map.iter().enumerate().filter_map(|(i, (k, v))| {
-            if VISIBLE_ACTIONS.contains(v) {
-                return Some((i, *k, *v));
-            }
-            None
-        })
-    }
-
-    fn find_action(&self, keybind: KeyBind) -> Option<Action> {
-        self.map
-            .iter()
-            .find_map(|(k, a)| (*k == keybind).then_some(a))
-            .copied()
-    }
-}
-
-#[derive(Default, Serialize, Deserialize)]
-#[serde(transparent)]
-struct History {
-    map: HashMap<String, Vec<PreparedMessage>>,
-}
-
-impl History {
-    fn add<'a>(&mut self, channel: &str, iter: impl IntoIterator<Item = &'a PreparedMessage>) {
-        let list = self.map.entry(channel.to_string()).or_default();
-        list.extend(iter.into_iter().cloned());
-        list.sort_unstable_by_key(|msg| msg.pm.ts);
-        list.dedup_by_key(|msg| msg.pm.ts)
-    }
-
-    // TODO std::io::Error
-    fn save(&self, path: impl AsRef<Path>) {
-        let _ = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .open(path)
-            .ok()
-            .map(std::io::BufWriter::new)
-            .map(|mut fi| {
-                let _ = serde_json::to_writer(&mut fi, self);
-                let _ = fi.flush();
-            });
-    }
-
-    fn load(path: impl AsRef<Path>) -> Self {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .open(path)
-            .ok()
-            .map(std::io::BufReader::new)
-            .and_then(|mut fi| serde_json::from_reader(&mut fi).ok())
-            .unwrap_or_default()
-    }
-}
-
-struct Presence {
-    tags: Tags,
-}
+mod span;
+use span::{EmoteSpan, TextSpan};
 
 struct Application {
     state: State,
@@ -1449,58 +1155,6 @@ impl<'a> CommandPalette<'a> {
     }
 }
 
-trait ChannelExt<'a> {
-    fn with_octo(self) -> Cow<'a, str>
-    where
-        Self: Sized + 'a;
-
-    fn without_octo(self) -> Self
-    where
-        Self: Sized;
-}
-
-impl<'a> ChannelExt<'a> for &'a str {
-    fn with_octo(self) -> Cow<'a, str>
-    where
-        Self: Sized,
-    {
-        if self.starts_with('#') {
-            return Cow::Borrowed(self);
-        }
-
-        Cow::from(format!("#{self}"))
-    }
-
-    fn without_octo(self) -> Self
-    where
-        Self: Sized,
-    {
-        self.strip_prefix('#').unwrap_or(self)
-    }
-}
-
-impl<'a> ChannelExt<'a> for String {
-    fn with_octo(self) -> Cow<'a, str>
-    where
-        Self: Sized,
-    {
-        if self.starts_with('#') {
-            return Cow::Owned(self);
-        }
-
-        Cow::from(format!("#{self}"))
-    }
-
-    fn without_octo(self) -> Self
-    where
-        Self: Sized,
-    {
-        self.strip_prefix('#')
-            .map(|s| s.to_string())
-            .unwrap_or(self)
-    }
-}
-
 struct AddChannel<'a> {
     state: &'a mut State,
     toasts: &'a mut Toasts,
@@ -1625,131 +1279,6 @@ impl<'a> TabBar<'a> {
     }
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct Ring<T> {
-    max: usize,
-    buf: VecDeque<T>,
-}
-
-impl<T> Ring<T> {
-    fn with_capacity(max: usize) -> Self {
-        assert!(max > 0, "max cannot be empty");
-        Self {
-            max,
-            buf: VecDeque::with_capacity(max),
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.buf.len()
-    }
-
-    fn empty_available(&self) -> usize {
-        self.max - self.len()
-    }
-
-    fn push(&mut self, item: T) {
-        while self.buf.len() >= self.max {
-            self.buf.pop_front();
-        }
-        self.buf.push_back(item);
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &T> + ExactSizeIterator {
-        self.buf.iter()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PreparedMessage {
-    pm: chat::Privmsg,
-    ts: String,
-    color: egui::Color32,
-    badges: Vec<String>,
-    message_spans: Vec<TextSpan>,
-}
-
-impl PreparedMessage {
-    fn new(pm: chat::Privmsg, map: &mut BadgeMap) -> Self {
-        static FORMAT: &[time::format_description::FormatItem<'static>] =
-            time::macros::format_description!("[hour]:[minute]:[second]");
-
-        let ts = pm.ts.to_offset(
-            time::UtcOffset::current_local_offset() //
-                .expect("system should know when UTC is"),
-        );
-
-        Self {
-            color: pm.tags.egui_color(),
-            badges: pm
-                .tags
-                .badges()
-                // BUG this flat_map should actually be a map
-                // it should look up unknown badges (how?)
-                .flat_map(|(k, v)| map.get(k, v))
-                .map(ToString::to_string)
-                .collect(),
-            message_spans: pm.tags.emotes(&pm.data),
-            ts: ts.format(&FORMAT).expect("valid timestamp"),
-            pm,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Buffer {
-    ring: Ring<PreparedMessage>,
-
-    message_stats: MessageStats,
-    text: String,
-}
-
-impl Buffer {
-    const MAX_SIZE: usize = 100;
-
-    fn new() -> Self {
-        Self {
-            ring: Ring::with_capacity(Self::MAX_SIZE),
-            message_stats: MessageStats::default(),
-            text: String::with_capacity(1024),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.ring.buf.clear();
-    }
-
-    fn load_history<'a>(&mut self, iter: impl IntoIterator<Item = &'a PreparedMessage>) {
-        for msg in iter.into_iter().cloned() {
-            self.ring.push(msg)
-        }
-    }
-
-    fn append(&mut self, message: PreparedMessage) {
-        self.message_stats.unread = self
-            .message_stats
-            .active
-            .then_some(0)
-            .unwrap_or(self.message_stats.unread + 1);
-        self.ring.push(message);
-    }
-}
-
-#[derive(Debug, Default)]
-struct MessageStats {
-    active: bool,
-    unread: usize,
-}
-
-impl MessageStats {
-    fn check_active(&mut self, active: bool) {
-        self.active = active;
-        if self.active {
-            self.unread = 0
-        }
-    }
-}
-
 struct TabButton<'a> {
     image: &'a img::Image,
     name: &'a str,
@@ -1842,187 +1371,6 @@ impl<'a> TabButton<'a> {
     }
 }
 
-mod chat;
-
-pub struct UserFetcher {
-    submit: flume::Sender<String>,
-    produce: flume::Receiver<Vec<helix::User>>,
-}
-
-impl UserFetcher {
-    pub fn spawn(client: helix::Client, repaint: impl Repaint + 'static) -> Self {
-        let (submit, submit_rx) = flume::unbounded::<String>();
-        let (produce_tx, produce) = flume::unbounded();
-
-        let mut seen = HashSet::new();
-        crate::runtime::spawn(async move {
-            let mut stream = submit_rx.into_stream();
-
-            while let Some(id) = stream.next().await {
-                if !seen.insert(id.clone()) {
-                    continue;
-                }
-
-                let client = client.clone();
-                let tx = produce_tx.clone();
-                let repaint = repaint.clone();
-
-                tokio::spawn(async move {
-                    let out = client.get_users([helix::IdOrLogin::Id(&id)]).await?;
-                    if !out.is_empty() {
-                        let _ = tx.send_async(out).await;
-                        repaint.repaint();
-                    }
-                    anyhow::Result::<_, anyhow::Error>::Ok(())
-                });
-            }
-        });
-
-        Self { submit, produce }
-    }
-
-    pub fn request(&self, id: &str) {
-        let _ = self.submit.send(id.to_string());
-    }
-
-    pub fn poll(&mut self, map: &mut UserMap) {
-        for user in self.produce.try_iter().into_iter().flatten() {
-            map.map.insert(user.id.clone(), user);
-        }
-    }
-}
-
-#[derive(Default, Debug, serde::Serialize, serde::Deserialize)]
-pub struct UserMap {
-    map: HashMap<String, helix::User>,
-}
-
-impl UserMap {
-    // TODO pre-populate this with the hidden user name endpoint
-    fn get(&mut self, id: &str, fetcher: &UserFetcher) -> Option<&helix::User> {
-        match self.map.get(id) {
-            Some(user) => Some(user),
-            None => {
-                fetcher.request(id);
-                None
-            }
-        }
-    }
-}
-
-pub trait WithIter<T>
-where
-    Self: Sized,
-{
-    fn with_iter(self, ex: impl IntoIterator<Item = T>) -> Self;
-}
-
-impl<C, T> WithIter<T> for C
-where
-    C: Extend<T>,
-{
-    fn with_iter(mut self, ex: impl IntoIterator<Item = T>) -> Self {
-        self.extend(ex);
-        self
-    }
-}
-
-#[derive(Default)]
-pub struct EmoteMap {
-    map: HashMap<String, String>,
-}
-
-impl EmoteMap {
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.map.get(key).map(|c| &**c)
-    }
-}
-
-impl<K, V> Extend<(K, V)> for EmoteMap
-where
-    K: ToString,
-    V: ToString,
-{
-    fn extend<I>(&mut self, iter: I)
-    where
-        I: IntoIterator<Item = (K, V)>,
-    {
-        self.map.extend(
-            iter.into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string())),
-        )
-    }
-}
-
-#[derive(Default)]
-pub struct BadgeMap {
-    map: HashMap<String, HashMap<String, String>>,
-}
-
-impl BadgeMap {
-    pub fn get(&self, id: &str, version: &str) -> Option<&str> {
-        self.map.get(id)?.get(version).map(|v| &**v)
-    }
-}
-
-impl<K, T, V> Extend<(K, (T, V))> for BadgeMap
-where
-    K: ToString,
-    T: ToString,
-    V: ToString,
-{
-    fn extend<I>(&mut self, iter: I)
-    where
-        I: IntoIterator<Item = (K, (T, V))>,
-    {
-        for (id, (k, v)) in iter {
-            self.map
-                .entry(id.to_string())
-                .or_default()
-                .insert(k.to_string(), v.to_string());
-        }
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum TextSpan {
-    Text(String),
-    Emote(EmoteSpan),
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct EmoteSpan {
-    urls: [String; 2],
-}
-
-impl EmoteSpan {
-    // TODO be much smarter about this non-sense
-    fn new(id: &str) -> Self {
-        Self {
-            urls: [
-                format!(
-                    "https://static-cdn.jtvnw.net/emoticons/v2/{id}/{format}/{theme_mode}/{scale}",
-                    id = id,
-                    format = "animated",
-                    theme_mode = "dark",
-                    scale = "2.0"
-                ),
-                format!(
-                    "https://static-cdn.jtvnw.net/emoticons/v2/{id}/{format}/{theme_mode}/{scale}",
-                    id = id,
-                    format = "static",
-                    theme_mode = "dark",
-                    scale = "2.0"
-                ),
-            ],
-        }
-    }
-
-    fn as_urls(&self) -> impl Iterator<Item = &str> + ExactSizeIterator {
-        self.urls.iter().map(|c| &**c)
-    }
-}
-
 fn load_icon() -> IconData {
     let img = ::image::load_from_memory(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -2078,61 +1426,6 @@ fn validate_state(state: &mut State) {
         for _ in 0..to_add {
             state.buffers.push(Buffer::new());
         }
-    }
-}
-
-struct Numbers {
-    images: [RetainedImage; 10],
-    plus: RetainedImage,
-}
-
-impl Numbers {
-    fn load() -> Self {
-        macro_rules! load {
-            ($id:expr) => {
-                egui_extras::RetainedImage::from_image_bytes(
-                    $id,
-                    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/numbers/", $id)),
-                )
-                .unwrap()
-            };
-        }
-
-        Self {
-            images: [
-                load!("zero.png"),
-                load!("one.png"),
-                load!("two.png"),
-                load!("three.png"),
-                load!("four.png"),
-                load!("five.png"),
-                load!("six.png"),
-                load!("seven.png"),
-                load!("eight.png"),
-                load!("nine.png"),
-            ],
-            plus: egui_extras::RetainedImage::from_image_bytes(
-                "plus.png",
-                include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/", "smorc.png")),
-            )
-            .unwrap(),
-        }
-    }
-
-    fn digits(&self, mut input: usize) -> impl Iterator<Item = &RetainedImage> {
-        let mut div = 1;
-        while input >= div * 10 {
-            div *= 10;
-        }
-        std::iter::from_fn(move || {
-            if div == 0 {
-                return None;
-            }
-            let v = input / div;
-            input %= div;
-            div /= 10;
-            Some(&self.images[v])
-        })
     }
 }
 

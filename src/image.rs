@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use egui::{Vec2, Widget};
+use egui::Vec2;
 use egui_extras::RetainedImage;
 use image::ImageFormat;
 use tokio_stream::StreamExt as _;
